@@ -1,20 +1,19 @@
 import asyncio
-from typing import Optional, TypeVar
+from typing import Optional
 
 import aioconsole
+from aiologger import Logger
 
 from config import configure_client_logging, client_arg_parser
 from constants import PORT, HOST
 
-T = TypeVar("T", bound="Client")
-
 
 class Client:
     def __init__(self,
-                 username,
-                 logger,
-                 server_host=HOST,
-                 server_port=PORT) -> None:
+                 username: str,
+                 logger: Logger,
+                 server_host: str = HOST,
+                 server_port: int = PORT) -> None:
         self.reader, self.writer = None, None
         self.logger = logger
         self.server_host: str = server_host
@@ -55,7 +54,7 @@ class Client:
         await self.writer.wait_closed()
         await self.logger.info('Server disconnect.')
 
-    async def __aenter__(self) -> T:
+    async def __aenter__(self) -> 'Client':
         await self.connect()
         await self.logger.info('Server connected.')
         return self
@@ -67,8 +66,7 @@ class Client:
         if message.startswith('/'):
             channel_message = message[1:].split()
             if channel_message[0] == 'invite':
-                message = f'{self.chat_name} ' + message
-                return message
+                return f'{self.chat_name} {message}'
             if channel_message[0] == 'create':
                 self.chat_name = channel_message[1]
             if channel_message[0] == 'join':
@@ -76,37 +74,40 @@ class Client:
             if channel_message[0] == 'leave':
                 self.chat_name = None
         elif self.chat_name is not None:
-            message = f'{self.chat_name} ' + message
+            message = f'{self.chat_name} {message}'
         return message
 
 
-async def main(username, host=HOST, port=PORT) -> None:
+async def main(username: str, host: str = HOST, port: int = PORT) -> None:
     client_logger = await configure_client_logging()
-    async with Client(username, client_logger, host, port) as client:
-        await client_logger.info(f'Client {username} started')
+    try:
+        async with Client(username, client_logger, host, port) as client:
+            await client_logger.info(f'Client {username} started')
 
-        async def handle_input():
+            async def handle_input():
+                while True:
+                    try:
+                        message = await aioconsole.ainput()
+                    except Exception as e:
+                        await client_logger.error(
+                            f'Error during the enter: {e}')
+                        continue
+                    message = client.check_message(message)
+                    await client.send(message)
+
+            input_task = asyncio.create_task(handle_input())
+            receive_task = asyncio.create_task(client.receive())
+
             while True:
-                try:
-                    message = await aioconsole.ainput()
-                except Exception as e:
-                    await client_logger.error(f'error during the enter: {e}')
-                    continue
-                message = client.check_message(message)
-                await client.send(message)
+                if not client.connected or client.error_occurred:
+                    input_task.cancel()
+                    receive_task.cancel()
+                    break
+                await asyncio.sleep(0.01)
 
-        input_task = asyncio.create_task(handle_input())
-        receive_task = asyncio.create_task(client.receive())
-
-        while True:
-            if not client.connected or client.error_occurred:
-                input_task.cancel()
-                receive_task.cancel()
-                break
-            await asyncio.sleep(0.01)
-
-        if client.error_occurred:
-            print("An error occurred in the receive task.")
+            if client.error_occurred:
+                client_logger.error('An error occurred in the receive task.')
+    finally:
         client_logger.info('logger finished its work')
         await client_logger.shutdown()
 
@@ -117,4 +118,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main(args.username, args.host, args.port))
     except KeyboardInterrupt:
-        print("Client stopped by user")
+        pass

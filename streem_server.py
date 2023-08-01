@@ -3,11 +3,13 @@ import json
 import os
 import time
 from asyncio import StreamReader, StreamWriter
+from typing import Optional
 
 from aiologger import Logger
 
 from config import configure_server_logging, server_arg_parser
 from constants import HOST, PORT
+from utils import generate_unique_code
 
 
 class Server:
@@ -17,6 +19,7 @@ class Server:
         self.message_list: list = []
         self.channels: dict = {}
         self.channels_message: dict = {}
+        self.access_codes: dict = {}
         self.usernames: dict = {}
         self.addresses: dict = {}
         if os.path.exists('server_state.json'):
@@ -43,7 +46,7 @@ class Server:
                 message = data.decode('UTF-8')
             except UnicodeDecodeError:
                 my_address = writer.get_extra_info('peername')
-                await self.logger.info(f'Unacceptable type of message.')
+                await self.logger.info('Unacceptable type of message.')
                 self.connections[my_address].write(
                     b'This message has unacceptable type!\n')
                 await self.connections[my_address].drain()
@@ -65,8 +68,7 @@ class Server:
                         if message_text[2] == message.strip():
                             break
                         last_messages_rev.append(message_text[0])
-                    last_messages = ''.join(
-                        text for text in list(reversed(last_messages_rev)))
+                    last_messages = ''.join(list(reversed(last_messages_rev)))
                     writer.write(last_messages.encode())
                     await writer.drain()
                 self.usernames[my_address] = message.strip()
@@ -92,10 +94,11 @@ class Server:
 
                 if message_text.startswith('/'):
                     message = message.split(' ', 1)[1].strip()
-                    await self.command_received(message[1:], my_address, channel_name)
+                    await self.command_received(message[1:], my_address,
+                                                channel_name)
                     continue
 
-                send_text = f'{self.usernames[my_address]}: ' + message_text
+                send_text = f'{self.usernames[my_address]}: {message_text}'
                 send_time = time.time()
                 name = self.usernames[my_address]
                 self.channels_message[channel_name].append(
@@ -109,24 +112,31 @@ class Server:
                 name = self.usernames[my_address]
                 send_text = f"{name}: {message}"
                 for client_address, client_writer in self.connections.items():
-                    if not any(client_address in addresslist for addresslist in self.channels.values()):
+                    if not any(
+                            client_address in address_list for address_list in
+                            self.channels.values()):
                         if client_address != my_address:
                             client_writer.write(send_text.encode())
                             await client_writer.drain()
                 send_time = time.time()
                 self.message_list.append((send_text, send_time, name,))
 
-    async def command_received(self,
-                               command: str,
-                               address: str,
-                               channel_name: str = None) -> None:
-        writer = self.connections[address]
+    async def join(self, writer: StreamWriter, command: str,
+                   address: str) -> None:
+        channel_name = command.split(' ')[1].strip()
+        try:
+            access_code = command.split(' ')[2].strip()
+        except IndexError:
+            writer.write(b'Provide a group access code\n')
+            await writer.drain()
+        username = self.usernames[address]
+        if username not in self.access_codes[channel_name]:
+            writer.write(b'Nobody invited you to this group!\n')
+            await writer.drain()
+        elif channel_name in self.channels and username in self.access_codes[channel_name]:
+            self.channels[channel_name].append(address)
 
-        if command.startswith('join '):
-            channel_name = command.split(' ', 1)[1].strip()
-            if channel_name in self.channels:
-                self.channels[channel_name].append(address)
-
+            if self.access_codes[channel_name][username] == access_code:
                 if self.channels_message[channel_name]:
                     last_messages_rev = []
                     for message_text in reversed(
@@ -135,71 +145,96 @@ class Server:
                             break
                         last_messages_rev.append(message_text[0])
                     last_messages = f'Вы подключились к чату {channel_name}\n' + ''.join(
-                        text for text in list(reversed(last_messages_rev)))
+                        list(reversed(last_messages_rev)))
                     writer.write(last_messages.encode())
 
                 elif not self.channels_message[channel_name]:
                     last_messages = f'Вы подключились к чату {channel_name}\n'
                     writer.write(last_messages.encode())
                 await writer.drain()
-            else:
-                writer.write(b'Channel does not exist\n')
+            elif self.access_codes[channel_name][username] != access_code:
+                writer.write(b'Non-existent access code\n')
                 await writer.drain()
+        else:
+            writer.write(b'Channel does not exist\n')
+            await writer.drain()
 
+    async def leave(self, writer: StreamWriter, command: str,
+                    address: str) -> None:
+        channel_name = command.split(' ', 1)[1].strip()
+        if channel_name in self.channels and address in self.channels[channel_name]:
+            self.channels[channel_name].remove(address)
+            last_messages_rev = []
+            name = self.usernames[address]
+            for message_text in self.message_list[::-1]:
+                if message_text[2] == name:
+                    break
+                last_messages_rev.append(message_text[0])
+            last_messages = f'Вы отключились от чата {channel_name}\n' + ''.join(
+                list(reversed(last_messages_rev)))
+            writer.write(last_messages.encode())
+            await writer.drain()
+        else:
+            writer.write(b'You are not in this channel\n')
+            await writer.drain()
+
+    async def create(self, writer: StreamWriter, command: str,
+                     address: str) -> None:
+        channel_name = command.split(' ', 1)[1].strip()
+        if channel_name not in self.channels:
+            self.channels[channel_name] = [address]
+            self.channels_message[channel_name] = []
+            self.access_codes[channel_name] = {self.usernames[address]: 'my'}
+            writer.write(
+                f'Вы подключились к чату {channel_name}\n'.encode())
+            await writer.drain()
+        else:
+            writer.write(b'Channel already exists\n')
+            await writer.drain()
+
+    async def private(self, writer: StreamWriter, command: str,
+                      address: str) -> None:
+        recipient, message = command.split(' ', 2)[1:]
+        if recipient.strip() in self.addresses:
+            message_text = f'{self.usernames[address]}: (private) {message}'
+            self.connections[self.addresses[recipient]].write(
+                message_text.encode())
+            await self.connections[self.addresses[recipient]].drain()
+        else:
+            writer.write(b'There is no user with such name.\n')
+            await writer.drain()
+
+    async def invite(self, writer: StreamWriter, command: str,
+                     channel_name: str) -> None:
+        username = command.split(' ', 1)[1].strip()
+        if username in self.addresses:
+            user_address = self.addresses[username]
+            access_code = generate_unique_code()
+            self.access_codes[channel_name][username] = access_code
+            message = f'Вы приглашены в группу ({channel_name})\n'
+            end_of_message = f'Для вступления введите команду "/join {channel_name} {access_code}"\n'
+            send_text = message + end_of_message
+            self.connections[user_address].write(send_text.encode())
+            await self.connections[user_address].drain()
+        else:
+            writer.write(b'There is no user with such name.\n')
+            await writer.drain()
+
+    async def command_received(self,
+                               command: str,
+                               address: str,
+                               channel_name: Optional[str] = None) -> None:
+        writer = self.connections[address]
+        if command.startswith('join '):
+            await self.join(writer, command, address)
         elif command.startswith('leave '):
-            channel_name = command.split(' ', 1)[1].strip()
-            if channel_name in self.channels and address in self.channels[
-                channel_name]:
-                self.channels[channel_name].remove(address)
-                last_messages_rev = []
-                name = self.usernames[address]
-                for message_text in self.message_list[::-1]:
-                    if message_text[2] == name:
-                        break
-                    last_messages_rev.append(message_text[0])
-                last_messages = ''.join(
-                    text for text in list(reversed(last_messages_rev)))
-                writer.write(last_messages.encode())
-                await writer.drain()
-            else:
-                writer.write(b'You are not in this channel\n')
-                await writer.drain()
-
+            await self.leave(writer, command, address)
         elif command.startswith('create '):
-            channel_name = command.split(' ', 1)[1].strip()
-            if channel_name not in self.channels:
-                self.channels[channel_name] = [address]
-                self.channels_message[channel_name] = []
-                writer.write(
-                    f'Вы подключились к чату {channel_name}\n'.encode())
-                await writer.drain()
-            else:
-                writer.write(b'Channel already exists\n')
-                await writer.drain()
-
+            await self.create(writer, command, address)
         elif command.startswith('private '):
-            recipient, message = command.split(' ', 2)[1:]
-            if recipient.strip() in self.addresses:
-                message_text = f'{self.usernames[address]}: ' + f'(private) {message}'
-                self.connections[self.addresses[recipient]].write(
-                    message_text.encode())
-                await self.connections[self.addresses[recipient]].drain()
-            else:
-                writer.write(b'There is no user with such name.\n')
-                await writer.drain()
-
+            await self.private(writer, command, address)
         elif command.startswith('invite '):
-            username = command.split(' ', 1)[1].strip()
-            if username in self.addresses:
-                user_address = self.addresses[username]
-                message = f'Вы приглашены в группу ({channel_name})\n'
-                end_of_message = f'Для вступления введите команду "/join {channel_name}"\n'
-                send_text = message + end_of_message
-                self.connections[user_address].write(send_text.encode())
-                await self.connections[user_address].drain()
-            else:
-                writer.write(b'There is no user with such name.\n')
-                await writer.drain()
+            await self.invite(writer, command, channel_name)
 
     async def remove_old_messages(self) -> None:
         while True:
@@ -219,26 +254,30 @@ class Server:
 
     async def save_state_to_file(self):
         data_to_save = {
-            "message_list": self.message_list,
-            "channels": {str(channel): [] for channel in self.channels.keys()},
-            "channels_message": {str(channel): messages for channel, messages
+            'message_list': self.message_list,
+            'channels': {str(channel): [] for channel in self.channels.keys()},
+            'channels_message': {str(channel): messages for channel, messages
                                  in self.channels_message.items()},
-            "usernames": {str(address): username for address, username in
-                          self.usernames.items()}
+            'usernames': {str(address): username for address, username in
+                          self.usernames.items()},
+            'access_codes': self.access_codes,
         }
         with open('server_state.json', 'w') as file:
-            json.dump(data_to_save, file)
+            json.dump(data_to_save, file, indent=2)
+        self.logger.info('Состояние сохранено в файл')
 
     def load_state_from_file(self):
         with open('server_state.json', 'r') as file:
             data_loaded = json.load(file)
-        self.message_list = data_loaded["message_list"]
+        self.message_list = data_loaded['message_list']
         self.channels = {channel: [] for channel in
-                         data_loaded["channels"].keys()}
+                         data_loaded['channels'].keys()}
         self.channels_message = {channel: messages for channel, messages
-                                 in data_loaded["channels_message"].items()}
+                                 in data_loaded['channels_message'].items()}
         self.usernames = {eval(address): username for address, username in
-                          data_loaded["usernames"].items()}
+                          data_loaded['usernames'].items()}
+        self.access_codes = data_loaded['access_codes']
+        self.logger.info('Состояние загружено из файла')
 
 
 async def main(host: str = HOST, port: int = PORT) -> None:
